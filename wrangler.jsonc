@@ -20,6 +20,9 @@
         "ALLOW_NEW_DEVICE": "true",
         "ALLOW_QUERY_NUMS": "true",
         "ROOT_PATH": "/",
+        "APNS_TEAM_ID": "NA6HPWARQ2",
+        "APNS_TOPIC": "com.davidpovarsky.bark",
+        "APNS_ENVIRONMENT": "production",
         // "BASIC_AUTH": ""
     }
 }
