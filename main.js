@@ -869,13 +869,8 @@ class APNs {
             const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
             return headerClaims + '.' + encodedSignature
         }
-        const getAuthToken = async () => {
-            const existing = await db.authorizationToken()
-            if (existing) return existing
-            const token = await generateAuthToken()
-            await db.saveAuthorizationToken(token)
-            return token
-        }
+        // Regenerate per request to avoid reusing JWTs issued for the upstream team.
+        const getAuthToken = generateAuthToken
         this.push = async (deviceToken, headers, aps) => {
             const topic = env.APNS_TOPIC
             if (!topic) throw new Error('APNs topic is not configured')
