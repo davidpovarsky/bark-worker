@@ -14,7 +14,7 @@ async function handleRequest(request, env, ctx) {
     ctx.waitUntil(db.cleanupExpiredSessions())
 
     const { searchParams, pathname } = new URL(request.url)
-    const handler = new Handler(db, { allowNewDevice, allowQueryNums })
+    const handler = new Handler(db, { allowNewDevice, allowQueryNums, env })
     const realPathname = pathname.replace((new RegExp('^' + rootPath.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'))), '/')
 
     switch (realPathname) {
@@ -272,6 +272,7 @@ class Handler {
         this.commit = '3db0918856d5aca4d141300c84d5c7a9f851ba44'
         this.allowNewDevice = options.allowNewDevice
         this.allowQueryNums = options.allowQueryNums
+        const env = options.env
 
         this.register = async (parameters) => {
             const deviceToken = parameters.get('devicetoken')
@@ -506,7 +507,7 @@ class Handler {
                 'apns-push-type': (_delete) ? 'background' : 'alert',
             }
 
-            const apns = new APNs(db)
+            const apns = new APNs(db, env)
             const response = await apns.push(deviceToken, headers, aps)
 
             if (response.status === 200) {
@@ -852,67 +853,39 @@ class Handler {
 }
 
 class APNs {
-    constructor(db) {
+    constructor(db, env) {
         const generateAuthToken = async () => {
-            const TOKEN_KEY = `
-            -----BEGIN PRIVATE KEY-----
-            MIGTAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBHkwdwIBAQQg4vtC3g5L5HgKGJ2+
-            T1eA0tOivREvEAY2g+juRXJkYL2gCgYIKoZIzj0DAQehRANCAASmOs3JkSyoGEWZ
-            sUGxFs/4pw1rIlSV2IC19M8u3G5kq36upOwyFWj9Gi3Ejc9d3sC7+SHRqXrEAJow
-            8/7tRpV+
-            -----END PRIVATE KEY-----
-            `
-
-            // Parse private key
-            const privateKeyPEM = TOKEN_KEY.replace('-----BEGIN PRIVATE KEY-----', '').replace('-----END PRIVATE KEY-----', '').replace(/\s/g, '')
-            // Decode private key
-            const privateKeyArrayBuffer = util.base64ToArrayBuffer(privateKeyPEM)
-            const privateKey = await crypto.subtle.importKey('pkcs8', privateKeyArrayBuffer, { name: 'ECDSA', namedCurve: 'P-256', }, false, ['sign'])
-            const TEAM_ID = '5U8LBRXG3A'
-            const AUTH_KEY_ID = 'LH4T9V5U4R'
-            // Generate the JWT token
-            const JWT_ISSUE_TIME = util.getTimestamp()
-            const JWT_HEADER = btoa(JSON.stringify({ alg: 'ES256', kid: AUTH_KEY_ID })).replace('+', '-').replace('/', '_').replace(/=+$/, '')
-            const JWT_CLAIMS = btoa(JSON.stringify({ iss: TEAM_ID, iat: JWT_ISSUE_TIME })).replace('+', '-').replace('/', '_').replace(/=+$/, '')
-            const JWT_HEADER_CLAIMS = JWT_HEADER + '.' + JWT_CLAIMS
-            // Sign
-            const jwtArray = new TextEncoder().encode(JWT_HEADER_CLAIMS)
-            const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, jwtArray)
-            const signatureArray = new Uint8Array(signature)
-            const JWT_SIGNED_HEADER_CLAIMS = btoa(String.fromCharCode(...signatureArray)).replace('+', '-').replace('/', '_').replace(/=+$/, '')
-            const AUTHENTICATION_TOKEN = JWT_HEADER_CLAIMS + '.' + JWT_SIGNED_HEADER_CLAIMS
-
-            return AUTHENTICATION_TOKEN
-        }
-
-        const getAuthToken = async () => {
-            let authToken = await db.authorizationToken()
-
-            if (authToken) {
-                return await authToken
+            const teamId = env.APNS_TEAM_ID
+            const keyId = env.APNS_KEY_ID
+            const keyPEM = env.APNS_PRIVATE_KEY
+            if (!teamId || !keyId || !keyPEM) {
+                throw new Error('APNs credentials are not configured in Cloudflare Worker secrets')
             }
-
-            authToken = await generateAuthToken()
-            await db.saveAuthorizationToken(authToken)
-
-            return authToken
+            const pem = keyPEM.replace(/\\n/g, '\n').replace('-----BEGIN PRIVATE KEY-----', '').replace('-----END PRIVATE KEY-----', '').replace(/\s/g, '')
+            const privateKey = await crypto.subtle.importKey('pkcs8', util.base64ToArrayBuffer(pem), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign'])
+            const encode = value => btoa(JSON.stringify(value)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+            const headerClaims = encode({ alg: 'ES256', kid: keyId }) + '.' + encode({ iss: teamId, iat: util.getTimestamp() })
+            const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, privateKey, new TextEncoder().encode(headerClaims))
+            const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+            return headerClaims + '.' + encodedSignature
         }
-
+        // Regenerate per request to avoid reusing JWTs issued for the upstream team.
+        const getAuthToken = generateAuthToken
         this.push = async (deviceToken, headers, aps) => {
-            const TOPIC = 'me.fin.bark'
-            const APNS_HOST_NAME = 'api.push.apple.com'
-            const AUTHENTICATION_TOKEN = await getAuthToken()
-
-            return await fetch(`https://${APNS_HOST_NAME}/3/device/${deviceToken}`, {
+            const topic = env.APNS_TOPIC
+            if (!topic) throw new Error('APNs topic is not configured')
+            const host = env.APNS_ENVIRONMENT === 'sandbox' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com'
+            const token = await getAuthToken()
+            return await fetch(`https://${host}/3/device/${deviceToken}`, {
                 method: 'POST',
                 headers: JSON.parse(JSON.stringify({
-                    'apns-topic': headers['apns-topic'] || TOPIC,
+                    'apns-topic': headers['apns-topic'] || topic,
                     'apns-id': headers['apns-id'] || undefined,
                     'apns-collapse-id': headers['apns-collapse-id'] || undefined,
                     'apns-priority': (headers['apns-priority'] > 0) ? headers['apns-priority'] : undefined,
                     'apns-expiration': headers['apns-expiration'] || util.getTimestamp() + 86400,
                     'apns-push-type': headers['apns-push-type'] || 'alert',
-                    'authorization': `bearer ${AUTHENTICATION_TOKEN}`,
+                    'authorization': `bearer ${token}`,
                     'content-type': 'application/json',
                 })),
                 body: JSON.stringify(aps),
